@@ -1,0 +1,86 @@
+# 数据库配置
+database:
+  host: localhost
+  name: your_database_name
+  user: your_username
+  password: your_password
+
+# 钱包配置 - 用于发送代币的账户
+wallet:
+  address: "0xYourWalletAddress"
+  private_key: "your_private_key_here"  # 请确保安全存储
+
+# 代币配置
+token:
+  contract_address: "0xTokenContractAddress"
+  symbol: "TOKEN"
+  decimals: 18
+  abi: |
+    [
+      {
+        "constant": true,
+        "inputs": [],
+        "name": "name",
+        "outputs": [{"name": "", "type": "string"}],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "constant": false,
+        "inputs": [
+          {"name": "_to", "type": "address"},
+          {"name": "_value", "type": "uint256"}
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "payable": false,
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "constant": true,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "constant": true,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+      }
+    ]
+
+# 区块链配置
+chain:
+  id: 56  # 56是BSC主网，97是BSC测试网
+
+# RPC节点配置 - 按优先级排序
+rpc_nodes:
+  - "https://bsc-dataseed.binance.org/"
+  - "https://bsc-dataseed1.defibit.io/"
+  - "https://bsc-dataseed1.ninicoin.io/"
+
+# Gas配置
+gas:
+  price: 5  # Gwei
+  limit: 210000  # 交易Gas上限
+
+# 程序配置
+batch_size: 10  # 每次处理的空投数量
+max_retries: 5  # 最大重试次数
+required_confirmations: 3  # 确认交易所需的区块数
+
+# 扫描间隔配置（秒）
+initial_scan_interval: 60  # 初始扫描间隔
+min_scan_interval: 10     # 最小扫描间隔
+max_scan_interval: 300    # 最大扫描间隔
+interval_adjustment: 10   # 每次调整的间隔值
+    

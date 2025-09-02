@@ -1,0 +1,17 @@
+[Unit]
+Description=BNB Chain Airdrop Sender
+After=network.target mysql.service
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/path/to/your/program/directory
+ExecStart=/usr/bin/python3 /path/to/your/program/directory/airdrop_sender.py
+Restart=always
+RestartSec=30
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+    
