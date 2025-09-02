@@ -1,34 +1,49 @@
+#!/usr/bin/env python3
+# BNB链自动空投发送程序
+# Copyright (C) 2023  开发者名称
+# 
+# 本程序是自由软件：你可以根据自由软件基金会发布的GNU通用公共许可证
+# （第三版或任何更新版本）重新分发和/或修改本程序。
+# 
+# 本程序的分发是希望它能有用，但没有任何保证；甚至没有隐含的适销性或特定用途的保证。
+# 详见GNU通用公共许可证了解更多信息。
+# 
+# 你应该已经收到了GNU通用公共许可证的副本。如果没有，请参见<https://www.gnu.org/licenses/>。
+
 import os
 import time
-import logging
 import yaml
-import random
-from datetime import datetime
-from web3 import Web3, exceptions
-from web3.middleware import geth_poa_middleware
-import mysql.connector
-from mysql.connector import Error
-from decimal import Decimal
+import logging
+import datetime
+import web3
+import web3.exceptions
+from web3 import Web3
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+from logging.handlers import RotatingFileHandler
 
 # 配置日志
 def setup_logger():
-    logger = logging.getLogger('airdrop_sender')
-    logger.setLevel(logging.INFO)
-    
-    # 确保日志目录存在
     if not os.path.exists('logs'):
         os.makedirs('logs')
     
-    # 创建文件处理器和控制台处理器
-    file_handler = logging.FileHandler(f'logs/airdrop_{datetime.now().strftime("%Y%m%d")}.log')
-    console_handler = logging.StreamHandler()
+    logger = logging.getLogger('AirdropSender')
+    logger.setLevel(logging.INFO)
     
-    # 定义日志格式
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # 文件日志
+    file_handler = RotatingFileHandler(
+        f'logs/airdrop_{datetime.date.today()}.log',
+        maxBytes=1024*1024*5,  # 5MB
+        backupCount=10
+    )
     file_handler.setFormatter(formatter)
+    
+    # 控制台日志
+    console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     
-    # 添加处理器
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
@@ -36,163 +51,146 @@ def setup_logger():
 
 # 加载配置
 def load_config():
-    try:
-        with open('config.yaml', 'r') as f:
-            return yaml.safe_load(f)
-    except Exception as e:
-        logger.error(f"加载配置文件失败: {str(e)}")
-        raise
+    with open('config.yaml', 'r') as f:
+        return yaml.safe_load(f)
 
-# 数据库连接
-def get_db_connection(config):
-    try:
-        connection = mysql.connector.connect(
-            host=config['database']['host'],
-            database=config['database']['name'],
-            user=config['database']['user'],
-            password=config['database']['password']
-        )
-        if connection.is_connected():
-            return connection
-    except Error as e:
-        logger.error(f"数据库连接失败: {str(e)}")
-        return None
-
-# 初始化错误表
-def init_error_table(connection):
-    if not connection:
-        return
+# 初始化数据库连接
+def init_db(config):
+    db_config = config['database']
+    db_uri = f"mysql+pymysql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+    engine = create_engine(db_uri, pool_pre_ping=True)
     
-    cursor = connection.cursor()
-    try:
-        cursor.execute("""
+    # 创建错误表（如果不存在）
+    with engine.connect() as conn:
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS airdrop_errors (
             id INT AUTO_INCREMENT PRIMARY KEY,
             airdrop_id INT NOT NULL,
-            user_id INT,
-            address VARCHAR(255),
-            amount DECIMAL(18, 8),
-            error_message TEXT,
+            userid INT NOT NULL,
+            address VARCHAR(255) NOT NULL,
+            amount DECIMAL(18, 8) NOT NULL,
+            error_message TEXT NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (airdrop_id) REFERENCES airdrop(id)
         )
-        """)
-        connection.commit()
-    except Error as e:
-        logger.error(f"初始化错误表失败: {str(e)}")
-    finally:
-        cursor.close()
-
-# 获取Web3连接
-def get_web3_connection(rpc_nodes, current_rpc_index=None):
-    if current_rpc_index is not None:
-        # 尝试使用指定的RPC节点
-        try:
-            w3 = Web3(Web3.HTTPProvider(rpc_nodes[current_rpc_index]))
-            if w3.is_connected():
-                w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-                return w3, current_rpc_index
-        except Exception as e:
-            logger.warning(f"RPC节点 {rpc_nodes[current_rpc_index]} 连接失败: {str(e)}")
+        """))
+        conn.commit()
     
-    # 尝试所有RPC节点
-    for i, rpc in enumerate(rpc_nodes):
+    return engine
+
+# 初始化Web3连接（带节点切换）
+def init_web3(rpc_nodes, logger):
+    for node in rpc_nodes:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc))
+            w3 = Web3(Web3.HTTPProvider(node))
             if w3.is_connected():
-                w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-                logger.info(f"成功连接到RPC节点: {rpc}")
-                return w3, i
+                logger.info(f"成功连接到RPC节点: {node}")
+                return w3, node
+            else:
+                logger.warning(f"无法连接到RPC节点: {node}，尝试下一个节点")
         except Exception as e:
-            logger.warning(f"RPC节点 {rpc} 连接失败: {str(e)}")
+            logger.warning(f"连接RPC节点 {node} 时出错: {str(e)}，尝试下一个节点")
     
     logger.error("所有RPC节点都无法连接")
-    return None, -1
+    return None, None
 
-# 检查余额是否足够
-def check_balances(w3, config, amount_needed):
+# 检查余额是否充足
+def check_balances(w3, config, required_amount, logger):
     try:
         sender_address = Web3.to_checksum_address(config['wallet']['address'])
-        
-        # 检查BNB余额（用于Gas）
-        bnb_balance = w3.eth.get_balance(sender_address)
-        bnb_balance_eth = w3.from_wei(bnb_balance, 'ether')
-        
-        # 检查代币余额
         token_contract = w3.eth.contract(
             address=Web3.to_checksum_address(config['token']['contract_address']),
             abi=config['token']['abi']
         )
-        token_balance = token_contract.functions.balanceOf(sender_address).call()
-        token_balance_decimal = token_balance / (10 ** config['token']['decimals'])
         
-        logger.info(f"当前BNB余额: {bnb_balance_eth} BNB")
-        logger.info(f"当前代币余额: {token_balance_decimal} {config['token']['symbol']}")
-        
-        # 检查Gas是否足够（预估每笔交易需要0.001 BNB）
-        gas_needed = config['batch_size'] * 0.001
-        if bnb_balance_eth < gas_needed:
-            logger.error(f"BNB余额不足，需要至少 {gas_needed} BNB 用于Gas")
+        # 检查BNB余额（用于支付gas）
+        bnb_balance = w3.eth.get_balance(sender_address)
+        if bnb_balance < Web3.to_wei(config['wallet']['min_bnb_balance'], 'ether'):
+            logger.error(f"BNB余额不足: {Web3.from_wei(bnb_balance, 'ether')} BNB")
             return False
         
-        # 检查代币是否足够
-        if token_balance_decimal < amount_needed:
-            logger.error(f"代币余额不足，需要 {amount_needed} {config['token']['symbol']}，但只有 {token_balance_decimal}")
+        # 检查代币余额
+        token_balance = token_contract.functions.balanceOf(sender_address).call()
+        if token_balance < Web3.to_wei(required_amount, 'ether'):
+            logger.error(f"代币余额不足: {Web3.from_wei(token_balance, 'ether')}，需要: {required_amount}")
             return False
             
         return True
     except Exception as e:
-        logger.error(f"余额检查失败: {str(e)}")
+        logger.error(f"检查余额时出错: {str(e)}")
         return False
 
 # 获取待处理的空投记录
-def get_pending_airdrops(connection, batch_size):
-    if not connection:
-        return []
-    
-    cursor = connection.cursor(dictionary=True)
+def get_pending_airdrops(engine, batch_size, logger):
     try:
-        # 查询状态为0（待发送）或状态为1（已发送但未确认）且需要重试的记录
-        cursor.execute("""
-        SELECT * FROM airdrop 
-        WHERE (aflag = 0 OR (aflag = 1 AND retry < %s))
-        ORDER BY aflag ASC, retry ASC, id ASC
-        LIMIT %s
-        """, (config['max_retries'], batch_size))
-        return cursor.fetchall()
-    except Error as e:
-        logger.error(f"查询待处理空投记录失败: {str(e)}")
+        with engine.connect() as conn:
+            # 使用FOR UPDATE锁定记录，防止并发处理
+            result = conn.execute(text("""
+            SELECT id, userid, address, amount FROM airdrop 
+            WHERE aflag = 0 AND retry < :max_retry 
+            ORDER BY id ASC LIMIT :batch_size
+            FOR UPDATE SKIP LOCKED
+            """), {
+                "max_retry": config['app']['max_retry'],
+                "batch_size": batch_size
+            })
+            
+            airdrops = result.fetchall()
+            conn.commit()
+            return airdrops
+    except SQLAlchemyError as e:
+        logger.error(f"获取待处理空投记录时出错: {str(e)}")
         return []
-    finally:
-        cursor.close()
+
+# 标记记录为处理中（关键的防重复发送步骤）
+def mark_airdrop_as_processing(engine, airdrop_id, logger):
+    try:
+        with engine.connect() as conn:
+            # 使用UPDATE ... WHERE确保原子性操作
+            result = conn.execute(text("""
+            UPDATE airdrop 
+            SET aflag = 1, stime = NOW() 
+            WHERE id = :id AND aflag = 0
+            """), {"id": airdrop_id})
+            
+            conn.commit()
+            
+            # 检查是否有行被更新
+            if result.rowcount == 1:
+                logger.info(f"成功将空投记录 {airdrop_id} 标记为处理中")
+                return True
+            else:
+                logger.error(f"更新空投记录 {airdrop_id} 状态失败，可能已被其他进程处理")
+                return False
+    except SQLAlchemyError as e:
+        logger.error(f"更新空投记录 {airdrop_id} 状态时出错: {str(e)}")
+        return False
 
 # 发送代币
-def send_token(w3, config, recipient, amount):
+def send_token(w3, config, airdrop, logger):
     try:
         sender_address = Web3.to_checksum_address(config['wallet']['address'])
         private_key = config['wallet']['private_key']
-        token_contract_address = Web3.to_checksum_address(config['token']['contract_address'])
+        recipient_address = Web3.to_checksum_address(airdrop.address)
         
-        # 创建合约实例
+        # 确保地址有效
+        if not Web3.is_address(recipient_address):
+            raise ValueError(f"无效的接收地址: {airdrop.address}")
+        
         token_contract = w3.eth.contract(
-            address=token_contract_address,
+            address=Web3.to_checksum_address(config['token']['contract_address']),
             abi=config['token']['abi']
         )
         
-        # 转换金额为最小单位
-        amount_wei = int(amount * (10 ** config['token']['decimals']))
-        
         # 构建交易
         nonce = w3.eth.get_transaction_count(sender_address)
-        tx = token_contract.functions.transfer(
-            Web3.to_checksum_address(recipient),
-            amount_wei
-        ).build_transaction({
+        amount_wei = Web3.to_wei(airdrop.amount, 'ether')
+        
+        tx = token_contract.functions.transfer(recipient_address, amount_wei).build_transaction({
             'from': sender_address,
             'nonce': nonce,
-            'gas': config['gas']['limit'],
-            'gasPrice': w3.to_wei(config['gas']['price'], 'gwei'),
-            'chainId': config['chain']['id']
+            'gas': config['transaction']['gas_limit'],
+            'gasPrice': w3.eth.gas_price
         })
         
         # 签名交易
@@ -200,287 +198,235 @@ def send_token(w3, config, recipient, amount):
         
         # 发送交易
         tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        tx_hash_hex = w3.to_hex(tx_hash)
         
-        # 返回交易哈希
-        return Web3.to_hex(tx_hash)
+        logger.info(f"交易已发送，哈希: {tx_hash_hex}, 接收地址: {recipient_address}, 金额: {airdrop.amount}")
+        return tx_hash_hex
         
-    except exceptions.InsufficientFunds:
-        logger.error("发送交易失败：余额不足")
-        return None
-    except exceptions.InvalidAddress:
-        logger.error(f"发送交易失败：无效地址 {recipient}")
-        return None
     except Exception as e:
-        logger.error(f"发送交易失败: {str(e)}")
+        logger.error(f"发送代币到 {airdrop.address} 时出错: {str(e)}")
         return None
 
-# 检查交易状态
-def check_transaction_status(w3, tx_hash, confirmations_needed=1):
+# 更新交易哈希
+def update_airdrop_tx_hash(engine, airdrop_id, tx_hash, logger):
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+            UPDATE airdrop 
+            SET tx_hash = :tx_hash 
+            WHERE id = :id
+            """), {
+                "tx_hash": tx_hash,
+                "id": airdrop_id
+            })
+            conn.commit()
+            logger.info(f"已更新空投记录 {airdrop_id} 的交易哈希")
+            return True
+    except SQLAlchemyError as e:
+        logger.error(f"更新空投记录 {airdrop_id} 的交易哈希时出错: {str(e)}")
+        return False
+
+# 检查交易是否确认
+def check_transaction_confirmation(w3, tx_hash, required_confirmations, logger):
     try:
         tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
-        if tx_receipt.status == 1:
-            # 交易成功，检查确认数
-            current_block = w3.eth.block_number
-            confirmations = current_block - tx_receipt.blockNumber
-            if confirmations >= confirmations_needed:
-                return "success", confirmations
-            else:
-                return "pending", confirmations
+        if tx_receipt is None:
+            return False, "交易尚未确认"
+            
+        current_block = w3.eth.block_number
+        confirmations = current_block - tx_receipt['blockNumber']
+        
+        if confirmations >= required_confirmations:
+            return True, "交易已确认"
         else:
-            return "failed", 0
-    except exceptions.TransactionNotFound:
-        return "not_found", 0
+            return False, f"等待更多确认 (当前: {confirmations}/{required_confirmations})"
+    except web3.exceptions.TransactionNotFound:
+        return False, "交易未找到"
     except Exception as e:
-        logger.error(f"检查交易状态失败: {str(e)}")
-        return "error", 0
+        logger.error(f"检查交易确认时出错: {str(e)}")
+        return False, str(e)
 
-# 更新空投记录状态
-def update_airdrop_status(connection, airdrop_id, status, tx_hash=None, retry_count=None):
-    if not connection:
-        return False
-    
-    cursor = connection.cursor()
+# 更新空投状态
+def update_airdrop_status(engine, airdrop_id, status, logger):
     try:
-        update_fields = ["aflag = %s", "stime = CURRENT_TIMESTAMP"]
-        params = [status, airdrop_id]
-        
-        if tx_hash:
-            update_fields.append("tx_hash = %s")
-            params.insert(1, tx_hash)
+        with engine.connect() as conn:
+            conn.execute(text("""
+            UPDATE airdrop 
+            SET aflag = :status 
+            WHERE id = :id
+            """), {
+                "status": status,
+                "id": airdrop_id
+            })
+            conn.commit()
+            logger.info(f"已将空投记录 {airdrop_id} 的状态更新为 {status}")
+            return True
+    except SQLAlchemyError as e:
+        logger.error(f"更新空投记录 {airdrop_id} 的状态时出错: {str(e)}")
+        return False
+
+# 处理发送失败
+def handle_send_failure(engine, airdrop, error_msg, logger, max_retry):
+    try:
+        with engine.connect() as conn:
+            # 增加重试次数
+            result = conn.execute(text("""
+            UPDATE airdrop 
+            SET retry = retry + 1, aflag = 0 
+            WHERE id = :id
+            """), {"id": airdrop.id})
             
-        if retry_count is not None:
-            update_fields.append("retry = %s")
-            params.insert(1, retry_count)
-        
-        query = f"UPDATE airdrop SET {', '.join(update_fields)} WHERE id = %s"
-        cursor.execute(query, params)
-        connection.commit()
-        return True
-    except Error as e:
-        logger.error(f"更新空投状态失败: {str(e)}")
-        connection.rollback()
-        return False
-    finally:
-        cursor.close()
-
-# 记录错误
-def log_error(connection, airdrop):
-    if not connection:
-        return False
-    
-    cursor = connection.cursor()
-    try:
-        cursor.execute("""
-        INSERT INTO airdrop_errors 
-        (airdrop_id, user_id, address, amount, error_message)
-        VALUES (%s, %s, %s, %s, %s)
-        """, (
-            airdrop['id'],
-            airdrop['userid'],
-            airdrop['address'],
-            airdrop['amount'],
-            f"达到最大重试次数 {config['max_retries']}"
-        ))
-        connection.commit()
-        return True
-    except Error as e:
-        logger.error(f"记录错误失败: {str(e)}")
-        connection.rollback()
-        return False
-    finally:
-        cursor.close()
-
-# 处理已发送但未确认的交易
-def process_pending_transactions(connection, w3):
-    if not connection or not w3:
-        return
-    
-    cursor = connection.cursor(dictionary=True)
-    try:
-        # 查询状态为1（已发送但未确认）的记录
-        cursor.execute("""
-        SELECT * FROM airdrop 
-        WHERE aflag = 1 AND tx_hash IS NOT NULL
-        """)
-        pending_transactions = cursor.fetchall()
-        
-        for tx in pending_transactions:
-            status, confirmations = check_transaction_status(
-                w3, 
-                tx['tx_hash'],
-                config['required_confirmations']
-            )
+            conn.commit()
             
-            if status == "success":
-                logger.info(f"交易 {tx['tx_hash']} 已确认，确认数: {confirmations}")
-                update_airdrop_status(connection, tx['id'], 2)
-            elif status == "failed":
-                logger.warning(f"交易 {tx['tx_hash']} 失败，将重试")
-                # 增加重试次数但保持状态为1，等待下一轮处理
-                update_airdrop_status(
-                    connection, 
-                    tx['id'], 
-                    1, 
-                    retry_count=tx['retry'] + 1
-                )
-            elif status == "not_found" and tx['retry'] < config['max_retries']:
-                logger.warning(f"交易 {tx['tx_hash']} 未找到，将重试")
-                update_airdrop_status(
-                    connection, 
-                    tx['id'], 
-                    1, 
-                    retry_count=tx['retry'] + 1
-                )
+            # 检查是否达到最大重试次数
+            if airdrop.retry + 1 >= max_retry:
+                # 记录到错误表
+                conn.execute(text("""
+                INSERT INTO airdrop_errors (airdrop_id, userid, address, amount, error_message)
+                VALUES (:airdrop_id, :userid, :address, :amount, :error_message)
+                """), {
+                    "airdrop_id": airdrop.id,
+                    "userid": airdrop.userid,
+                    "address": airdrop.address,
+                    "amount": airdrop.amount,
+                    "error_message": error_msg
+                })
                 
-    except Error as e:
-        logger.error(f"处理未确认交易失败: {str(e)}")
-    finally:
-        cursor.close()
+                # 标记为失败
+                conn.execute(text("""
+                UPDATE airdrop 
+                SET aflag = 3 
+                WHERE id = :id
+                """), {"id": airdrop.id})
+                
+                conn.commit()
+                logger.warning(f"空投记录 {airdrop.id} 达到最大重试次数，已记录到错误表")
+                return False
+            
+            logger.info(f"空投记录 {airdrop.id} 发送失败，已重试 {airdrop.retry + 1} 次")
+            return True
+    except SQLAlchemyError as e:
+        logger.error(f"处理空投记录 {airdrop.id} 发送失败时出错: {str(e)}")
+        return False
 
 # 主处理函数
-def process_airdrops():
-    global config, logger
+def process_airdrops(engine, w3, config, logger):
+    batch_size = config['app']['batch_size']
+    max_retry = config['app']['max_retry']
+    required_confirmations = config['transaction']['required_confirmations']
     
-    # 初始化变量
-    current_rpc_index = None
-    scan_interval = config['initial_scan_interval']
+    # 获取待处理的空投记录
+    airdrops = get_pending_airdrops(engine, batch_size, logger)
+    logger.info(f"找到 {len(airdrops)} 条待处理的空投记录")
     
-    while True:
-        try:
-            # 连接数据库
-            db_connection = get_db_connection(config)
-            if not db_connection:
-                time.sleep(scan_interval)
-                continue
-            
-            # 初始化错误表（首次运行时）
-            init_error_table(db_connection)
-            
-            # 获取待处理的空投记录
-            pending_airdrops = get_pending_airdrops(db_connection, config['batch_size'])
-            logger.info(f"发现 {len(pending_airdrops)} 条待处理的空投记录")
-            
-            # 根据待处理数量调整扫描间隔
-            if len(pending_airdrops) == 0:
-                # 没有待处理记录，延长扫描间隔
-                scan_interval = min(
-                    scan_interval + config['interval_adjustment'], 
-                    config['max_scan_interval']
-                )
-                logger.info(f"没有待处理记录，下次扫描间隔调整为 {scan_interval} 秒")
-            else:
-                # 有待处理记录，缩短扫描间隔
-                scan_interval = max(
-                    scan_interval - config['interval_adjustment'], 
-                    config['min_scan_interval']
-                )
-                logger.info(f"有待处理记录，下次扫描间隔调整为 {scan_interval} 秒")
-            
-            # 如果没有待处理记录，直接进入下一轮
-            if not pending_airdrops:
-                db_connection.close()
-                time.sleep(scan_interval)
-                continue
-            
-            # 计算所需总代币数量
-            total_amount = sum(Decimal(str(airdrop['amount'])) for airdrop in pending_airdrops)
-            
-            # 连接到区块链节点
-            w3, current_rpc_index = get_web3_connection(
-                config['rpc_nodes'], 
-                current_rpc_index
-            )
-            if not w3:
-                logger.error("无法连接到任何区块链节点，将在下次尝试")
-                db_connection.close()
-                time.sleep(scan_interval)
-                continue
-            
-            # 检查余额
-            if not check_balances(w3, config, float(total_amount)):
-                logger.error("余额不足，无法处理空投，将在下次尝试")
-                db_connection.close()
-                time.sleep(scan_interval)
-                continue
-            
-            # 处理待发送的空投
-            for airdrop in pending_airdrops:
-                try:
-                    logger.info(f"处理空投记录 ID: {airdrop['id']}, 地址: {airdrop['address']}, 数量: {airdrop['amount']}")
-                    
-                    # 发送代币
-                    tx_hash = send_token(
-                        w3, 
-                        config, 
-                        airdrop['address'], 
-                        float(airdrop['amount'])
-                    )
-                    
-                    if tx_hash:
-                        logger.info(f"交易已发送，哈希: {tx_hash}")
-                        # 更新状态为1（已发送）
-                        update_airdrop_status(
-                            db_connection, 
-                            airdrop['id'], 
-                            1, 
-                            tx_hash,
-                            airdrop['retry'] + 1
-                        )
-                    else:
-                        logger.error(f"发送空投失败，记录 ID: {airdrop['id']}")
-                        # 增加重试次数
-                        new_retry_count = airdrop['retry'] + 1
-                        if new_retry_count >= config['max_retries']:
-                            # 达到最大重试次数，记录错误并标记为失败
-                            logger.error(f"达到最大重试次数，记录错误，ID: {airdrop['id']}")
-                            update_airdrop_status(db_connection, airdrop['id'], 3)  # 3表示失败
-                            log_error(db_connection, airdrop)
-                        else:
-                            # 更新重试次数，保持状态为0（待发送）
-                            update_airdrop_status(
-                                db_connection, 
-                                airdrop['id'], 
-                                0, 
-                                retry_count=new_retry_count
-                            )
-                            
-                except Exception as e:
-                    logger.error(f"处理空投记录 {airdrop['id']} 时出错: {str(e)}")
-                    # 增加重试次数
-                    new_retry_count = airdrop['retry'] + 1
-                    update_airdrop_status(
-                        db_connection, 
-                        airdrop['id'], 
-                        0, 
-                        retry_count=new_retry_count
-                    )
-            
-            # 处理已发送但未确认的交易
-            process_pending_transactions(db_connection, w3)
-            
-            # 关闭数据库连接
-            db_connection.close()
-            
-        except Exception as e:
-            logger.error(f"主循环出错: {str(e)}")
+    if not airdrops:
+        return 0
+    
+    # 计算所需总金额
+    total_amount = sum(airdrop.amount for airdrop in airdrops)
+    
+    # 检查余额
+    if not check_balances(w3, config, total_amount, logger):
+        return 0
+    
+    # 处理每条记录
+    success_count = 0
+    for airdrop in airdrops:
+        # 关键步骤：先标记记录为处理中，确保原子性
+        if not mark_airdrop_as_processing(engine, airdrop.id, logger):
+            # 如果标记失败，立即停止处理，防止重复发送
+            logger.critical("标记记录为处理中失败，为防止重复发送，程序将停止")
+            # 可以考虑发送告警通知
+            return success_count
         
-        # 等待下一次扫描
-        logger.info(f"等待 {scan_interval} 秒后进行下一次扫描")
-        time.sleep(scan_interval)
+        # 发送代币
+        tx_hash = send_token(w3, config, airdrop, logger)
+        
+        if tx_hash:
+            # 更新交易哈希
+            if update_airdrop_tx_hash(engine, airdrop.id, tx_hash, logger):
+                # 等待交易确认
+                confirmed = False
+                for _ in range(config['transaction']['confirmation_check_attempts']):
+                    confirmed, msg = check_transaction_confirmation(
+                        w3, tx_hash, required_confirmations, logger
+                    )
+                    logger.info(f"交易 {tx_hash} 确认状态: {msg}")
+                    
+                    if confirmed:
+                        # 更新状态为已确认
+                        update_airdrop_status(engine, airdrop.id, 2, logger)
+                        success_count += 1
+                        break
+                    
+                    time.sleep(config['transaction']['confirmation_check_interval'])
+                
+                if not confirmed:
+                    logger.warning(f"交易 {tx_hash} 在指定时间内未确认")
+                    # 不更新状态为失败，留待下一轮检查
+        else:
+            # 发送失败，处理重试
+            handle_send_failure(engine, airdrop, "发送交易失败", logger, max_retry)
+    
+    return success_count
+
+# 主函数
+def main():
+    global config
+    logger = setup_logger()
+    logger.info("启动BNB链自动空投发送程序")
+    
+    try:
+        # 加载配置
+        config = load_config()
+        
+        # 初始化数据库
+        engine = init_db(config)
+        
+        # 初始化Web3连接
+        w3, current_node = init_web3(config['rpc_nodes'], logger)
+        if not w3:
+            logger.error("无法连接到任何RPC节点，程序退出")
+            return
+        
+        # 初始扫描间隔
+        scan_interval = config['app']['initial_scan_interval']
+        min_interval = config['app']['min_scan_interval']
+        max_interval = config['app']['max_scan_interval']
+        interval_adjustment = config['app']['interval_adjustment']
+        
+        while True:
+            try:
+                # 检查Web3连接
+                if not w3.is_connected():
+                    logger.warning("Web3连接已断开，尝试重新连接")
+                    w3, current_node = init_web3(config['rpc_nodes'], logger)
+                    if not w3:
+                        logger.error("无法重新连接到任何RPC节点，等待下一轮")
+                        time.sleep(scan_interval)
+                        continue
+                
+                # 处理空投
+                processed_count = process_airdrops(engine, w3, config, logger)
+                
+                # 动态调整扫描间隔
+                if processed_count == 0:
+                    # 没有处理任何记录，延长间隔
+                    scan_interval = min(scan_interval + interval_adjustment, max_interval)
+                else:
+                    # 处理了记录，缩短间隔
+                    scan_interval = max(scan_interval - interval_adjustment, min_interval)
+                
+                logger.info(f"本轮处理完成，下次扫描间隔: {scan_interval}秒")
+                time.sleep(scan_interval)
+                
+            except Exception as e:
+                logger.error(f"主循环出错: {str(e)}", exc_info=True)
+                time.sleep(scan_interval)
+    
+    except Exception as e:
+        logger.critical(f"程序初始化失败: {str(e)}", exc_info=True)
+        return
 
 if __name__ == "__main__":
-    # 初始化日志
-    logger = setup_logger()
-    logger.info("===== 启动空投发送程序 =====")
-    
-    # 加载配置
-    try:
-        config = load_config()
-        logger.info("配置文件加载成功")
-    except Exception as e:
-        logger.error("无法加载配置文件，程序退出")
-        exit(1)
-    
-    # 启动主处理函数
-    process_airdrops()
-    
+    main()
